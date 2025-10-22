@@ -7,6 +7,61 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import os from "os";
+import { createInterface as createReadlineInterface } from "node:readline";
+
+// ---------------------
+// Payload limiting
+// ---------------------
+const MAX_TEXT_BYTES = (() => {
+  const v = Number.parseInt(process.env.MCP_MAX_TEXT_BYTES || "180000", 10);
+  return Number.isFinite(v) && v > 1024 ? v : 180000; // ~180 KB default
+})();
+
+function byteLengthUtf8(str) {
+  return Buffer.byteLength(str ?? "", "utf8");
+}
+
+function truncateUtf8(str, maxBytes) {
+  if (byteLengthUtf8(str) <= maxBytes) return { text: str, truncated: false };
+  const buf = Buffer.from(str, "utf8");
+  const sliced = buf.subarray(0, Math.max(0, maxBytes - 3));
+  const text = sliced.toString("utf8");
+  return { text: text + "\n…[truncated]", truncated: true };
+}
+
+async function readNdjsonPage(filePath, { lineOffset = 0, lineLimit = 500, maxBytes = MAX_TEXT_BYTES } = {}) {
+  return await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+    const rl = createReadlineInterface({ input: stream, crlfDelay: Infinity });
+    let idx = -1;
+    let returned = 0;
+    let out = "";
+    let overBytes = false;
+    rl.on("line", (line) => {
+      idx++;
+      if (idx < lineOffset) return;
+      if (returned >= lineLimit) return; // keep reading to know hasMore
+      const candidate = (out ? out + "\n" : "") + line;
+      if (byteLengthUtf8(candidate) > maxBytes) {
+        overBytes = true;
+        rl.close();
+        return;
+      }
+      out = candidate;
+      returned++;
+    });
+    rl.once("close", () => {
+      const hasMore = overBytes || returned >= lineLimit;
+      resolve({ text: out, returned, hasMore, offset: lineOffset });
+    });
+    rl.once("error", (err) => {
+      reject(err);
+    });
+    stream.once("error", (err) => {
+      reject(err);
+    });
+  });
+}
 
 // ---------------------
 // Simple job manager (ported from index.js)
@@ -141,7 +196,15 @@ async function exportCsvOnce({ url, mode = "json", limit = null, offset = 0 }) {
       parser.on("data", (row) => {
         rowIndex++;
         if (rowIndex <= offset) return;
-        nd += JSON.stringify(row) + "\n";
+        const next = (nd ? nd + "\n" : "") + JSON.stringify(row);
+        // Guardrail: enforce byte ceiling as we build
+        if (byteLengthUtf8(next) > MAX_TEXT_BYTES) {
+          try { sourceStream.destroy(); } catch {}
+          try { parser.destroy(); } catch {}
+          const { text } = truncateUtf8(next, MAX_TEXT_BYTES);
+          return resolve({ ndjson: text, returned: sent, offset, truncated: true });
+        }
+        nd = next;
         sent++;
         if (limit && sent >= limit) {
           try { sourceStream.destroy(); } catch {}
@@ -317,7 +380,10 @@ registerTool(
       properties: {
         jobId: { type: "string" },
         fileName: { type: "string", description: "e.g., chunk_1.ndjson" },
-        encoding: { type: "string", enum: ["text", "base64"], description: "Return as plain text or base64", default: "text" }
+        encoding: { type: "string", enum: ["text", "base64"], description: "Return as plain text or base64", default: "text" },
+        lineOffset: { type: "number", description: "Zero-based line offset for paging NDJSON", default: 0 },
+        lineLimit: { type: "number", description: "Max lines to return for this page", default: 500 },
+        maxBytes: { type: "number", description: "Hard ceiling on response size in bytes", default: MAX_TEXT_BYTES }
       },
       required: ["jobId", "fileName"],
       additionalProperties: false
@@ -331,12 +397,31 @@ registerTool(
     const filePath = path.join(dir, safeName);
     if (!fs.existsSync(filePath)) return { isError: true, content: [{ type: "text", text: "File not found" }] };
 
+    const lineOffset = Number.isFinite(input.lineOffset) && input.lineOffset > 0 ? Math.floor(input.lineOffset) : 0;
+    const lineLimit = Number.isFinite(input.lineLimit) && input.lineLimit > 0 ? Math.floor(input.lineLimit) : 500;
+    const maxBytes = Number.isFinite(input.maxBytes) && input.maxBytes > 1024 ? Math.floor(input.maxBytes) : MAX_TEXT_BYTES;
+
+    const page = await readNdjsonPage(filePath, { lineOffset, lineLimit, maxBytes });
+
     if (input.encoding === "base64") {
-      const buf = fs.readFileSync(filePath);
-      return { content: [{ type: "text", text: buf.toString("base64") }] };
+      const buf = Buffer.from(page.text, "utf8");
+      const b64 = buf.toString("base64");
+      const note = {
+        file: safeName,
+        lineOffset,
+        returnedLines: page.returned,
+        hasMore: page.hasMore,
+        encoding: "base64",
+      };
+      return { content: [
+        { type: "text", text: JSON.stringify(note) },
+        { type: "text", text: b64 }
+      ] };
     } else {
-      const data = fs.readFileSync(filePath, "utf8");
-      return { content: [{ type: "text", text: data }] };
+      const note = `{"file":"${safeName}","lineOffset":${lineOffset},"returnedLines":${page.returned},"hasMore":${page.hasMore}}\n`;
+      const joined = note + page.text;
+      const { text } = truncateUtf8(joined, maxBytes);
+      return { content: [{ type: "text", text }] };
     }
   }
 );
@@ -359,14 +444,133 @@ registerTool(
   },
   async (input) => {
     try {
-      const result = await exportCsvOnce({ url: input.url, mode: input.mode || "json", limit: input.limit ?? null, offset: input.offset || 0 });
-      if (input.mode === "ndjson") {
-        return { content: [{ type: "text", text: result.ndjson }] };
+      const mode = input.mode || "json";
+      const userLimit = Number.isFinite(input.limit) ? Math.max(0, Math.floor(input.limit)) : null;
+      // Safe defaults: cap rows when not specified
+      const effectiveLimit = userLimit ?? (mode === "ndjson" ? 300 : 200);
+      const result = await exportCsvOnce({ url: input.url, mode, limit: effectiveLimit, offset: input.offset || 0 });
+      if (mode === "ndjson") {
+        const { text } = truncateUtf8(result.ndjson || "", MAX_TEXT_BYTES);
+        return { content: [{ type: "text", text }] };
       } else {
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        let payload = result;
+        let text = JSON.stringify(payload, null, 2);
+        if (byteLengthUtf8(text) > MAX_TEXT_BYTES) {
+          // If still too big, trim rows until it fits
+          const rows = Array.isArray(payload.rows) ? payload.rows : [];
+          let hi = rows.length;
+          let lo = 0;
+          let mid = Math.min(hi, 200);
+          while (lo < hi) {
+            const tryCount = mid;
+            const t = JSON.stringify({ ...payload, rows: rows.slice(0, tryCount), returned: tryCount, has_more: true }, null, 2);
+            if (byteLengthUtf8(t) <= MAX_TEXT_BYTES || tryCount <= 1) {
+              text = t;
+              break;
+            }
+            hi = tryCount - 1;
+            mid = Math.floor((lo + hi) / 2);
+          }
+        }
+        return { content: [{ type: "text", text }] };
       }
     } catch (err) {
       return { isError: true, content: [{ type: "text", text: `Export failed: ${String(err.message || err)}` }] };
+    }
+  }
+);
+
+// Targeted row finder to avoid large payloads for LLMs
+registerTool(
+  {
+    name: "gsheets_find_rows",
+    description: "Stream a Google Sheets CSV and return only matching rows by email/name. Reduces payload vs exporting the whole sheet.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "CSV export URL (e.g., https://docs.google.com/.../export?format=csv)" },
+        email: { type: "string", nullable: true, description: "Match on Email column" },
+        name: { type: "string", nullable: true, description: "Match on Name column" },
+        matchMode: { type: "string", enum: ["exact", "contains"], description: "Matching strategy", default: "exact" },
+        caseInsensitive: { type: "boolean", description: "Case-insensitive match", default: true },
+        select: { type: "array", items: { type: "string" }, nullable: true, description: "Columns to include in results" },
+        maxMatches: { type: "number", description: "Max rows to return", default: 5 }
+      },
+      required: ["url"],
+      additionalProperties: false
+    }
+  },
+  async (input) => {
+    const url = String(input.url);
+    const wantEmail = input.email ? String(input.email) : null;
+    const wantName = input.name ? String(input.name) : null;
+    const matchMode = (input.matchMode === "contains" ? "contains" : "exact");
+    const caseInsensitive = input.caseInsensitive !== false;
+    const maxMatches = Number.isFinite(input.maxMatches) && input.maxMatches > 0 ? Math.floor(input.maxMatches) : 5;
+    const select = Array.isArray(input.select) && input.select.length ? input.select.map(String) : null;
+
+    if (!wantEmail && !wantName) {
+      return { isError: true, content: [{ type: "text", text: "Provide at least one of: email or name" }] };
+    }
+
+    const normalize = (v) => String(v ?? "").trim();
+    const normForCmp = (v) => {
+      const s = normalize(v);
+      return caseInsensitive ? s.toLowerCase() : s;
+    };
+    const cmp = (value, target) => {
+      const a = normForCmp(value);
+      const b = normForCmp(target);
+      if (matchMode === "contains") return a.includes(b);
+      return a === b;
+    };
+
+    const matches = [];
+    let scanned = 0;
+
+    try {
+      const response = await axios.get(url, { responseType: "stream" });
+      const sourceStream = response.data;
+      const parser = parse({ columns: true, skip_empty_lines: true });
+
+      const done = await new Promise((resolve, reject) => {
+        sourceStream.pipe(parser);
+
+        parser.on("data", (row) => {
+          scanned++;
+          // Columns are case-sensitive; use exact header names from sheet
+          const rowEmail = row.Email ?? row.email ?? row["E-mail"] ?? "";
+          const rowName = row.Name ?? row.name ?? "";
+          let ok = true;
+          if (wantEmail) ok = ok && cmp(rowEmail, wantEmail);
+          if (wantName) ok = ok && cmp(rowName, wantName);
+          if (ok) {
+            const out = select ? Object.fromEntries(select.map(k => [k, row[k]])) : row;
+            matches.push(out);
+            if (matches.length >= maxMatches) {
+              try { sourceStream.destroy(); } catch {}
+              try { parser.destroy(); } catch {}
+              resolve(true);
+            }
+          }
+        });
+
+        parser.on("end", () => resolve(true));
+        parser.on("error", (err) => reject(err));
+        sourceStream.on("error", (err) => reject(err));
+      });
+
+      const payload = { scannedRows: scanned, returned: matches.length, matches };
+      let text = JSON.stringify(payload, null, 2);
+      if (byteLengthUtf8(text) > MAX_TEXT_BYTES) {
+        // If somehow too big, trim matches
+        const max = Math.max(1, Math.floor(matches.length / 2));
+        const trimmed = { scannedRows: scanned, returned: max, matches: matches.slice(0, max) };
+        text = JSON.stringify(trimmed, null, 2);
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (err) {
+      return { isError: true, content: [{ type: "text", text: `Find failed: ${String(err.message || err)}` }] };
     }
   }
 );

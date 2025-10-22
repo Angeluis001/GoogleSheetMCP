@@ -1,0 +1,21 @@
+{
+  "name": "google-sheet-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "start:http": "node index.js",
+    "start:mcp": "node mcp-server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.6.0",
+    "axios": "^1.11.0",
+    "csv-parse": "^6.1.0",
+    "express": "^5.1.0",
+    "google-sheet-mcp": "file:"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
