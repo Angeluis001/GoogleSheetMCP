@@ -1,28 +1,37 @@
-const express = require('express');
-const axios = require('axios');
-const { parse } = require('csv-parse');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const crypto = require('crypto');
+import express from "express";
+import axios from "axios";
+import { parse } from "csv-parse";
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import { fileURLToPath } from "url";
 
+import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
+import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Express app setup
 const app = express();
-app.use(express.json());
+app.set("trust proxy", true);
+app.use(express.json({ limit: "2mb" }));
 
-// Log every incoming request
-app.use((req, res, next) => {
+// Basic request logging
+app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
 });
 
-// Simple in-memory job store. For production, persist to a DB.
+// ---------------------
+// CSV job utilities (shared with MCP tools)
+// ---------------------
 const jobs = new Map();
-const JOBS_ROOT = path.join(__dirname, 'jobs');
+const JOBS_ROOT = path.join(process.cwd(), "jobs");
 if (!fs.existsSync(JOBS_ROOT)) fs.mkdirSync(JOBS_ROOT, { recursive: true });
 
 function makeId() {
-  return crypto.randomBytes(8).toString('hex');
+  return crypto.randomBytes(8).toString("hex");
 }
 
 function createJobRecord({ id, url, chunkSize }) {
@@ -32,7 +41,7 @@ function createJobRecord({ id, url, chunkSize }) {
     id,
     url,
     chunkSize,
-    status: 'pending', // pending | running | completed | failed
+    status: "pending", // pending | running | completed | failed
     createdAt: new Date().toISOString(),
     startedAt: null,
     finishedAt: null,
@@ -44,18 +53,13 @@ function createJobRecord({ id, url, chunkSize }) {
   return { record, dir };
 }
 
-// POST /jobs - start async job that streams CSV, writes NDJSON files per chunk
-app.post('/jobs', (req, res) => {
-  const { url, chunkSize } = req.body;
-  if (!url) return res.status(400).json({ error: 'Missing url in body' });
-  const size = parseInt(chunkSize, 10) || 500;
+async function startCsvJob({ url, chunkSize }) {
+  const size = Number.isFinite(chunkSize) && chunkSize > 0 ? Math.floor(chunkSize) : 500;
   const id = makeId();
-
   const { record, dir } = createJobRecord({ id, url, chunkSize: size });
 
-  // Start processing asynchronously
   (async () => {
-    record.status = 'running';
+    record.status = "running";
     record.startedAt = new Date().toISOString();
 
     let currentFileStream = null;
@@ -68,7 +72,7 @@ app.post('/jobs', (req, res) => {
       fileIndex += 1;
       currentFileName = `chunk_${fileIndex}.ndjson`;
       currentFilePath = path.join(dir, currentFileName);
-      currentFileStream = fs.createWriteStream(currentFilePath, { flags: 'w' });
+      currentFileStream = fs.createWriteStream(currentFilePath, { flags: "w" });
       rowsInChunk = 0;
       record.files.push({ name: currentFileName, path: currentFilePath, rows: 0 });
     }
@@ -77,239 +81,585 @@ app.post('/jobs', (req, res) => {
       if (currentFileStream) {
         currentFileStream.end();
         currentFileStream = null;
-        // update rows count in metadata
         const f = record.files[record.files.length - 1];
         if (f) f.rows = rowsInChunk;
       }
     }
 
     try {
-      const response = await axios.get(url, { responseType: 'stream' });
+      const response = await axios.get(url, { responseType: "stream" });
       const sourceStream = response.data;
       const parser = parse({ columns: true, skip_empty_lines: true });
 
       openNewChunk();
 
-      parser.on('data', (row) => {
-        // When a new row is parsed, write it as a JSON line
-        const line = JSON.stringify(row) + '\n';
+      parser.on("data", (row) => {
+        const line = JSON.stringify(row) + "\n";
         if (!currentFileStream) openNewChunk();
-        const ok = currentFileStream.write(line);
+        currentFileStream.write(line);
         rowsInChunk += 1;
         record.totalRows += 1;
-
-        // If reached chunkSize, close and open new
         if (rowsInChunk >= size) {
           closeChunk();
           openNewChunk();
         }
       });
 
-      parser.on('end', () => {
+      parser.on("end", () => {
         closeChunk();
-        record.status = 'completed';
+        record.status = "completed";
         record.finishedAt = new Date().toISOString();
-        console.log(`Job ${id} completed, rows=${record.totalRows}, files=${record.files.length}`);
       });
 
-      parser.on('error', (err) => {
-        console.error('CSV parser error for job', id, err);
-        record.status = 'failed';
+      parser.on("error", (err) => {
+        record.status = "failed";
         record.error = String(err.message || err);
         record.finishedAt = new Date().toISOString();
-        try { closeChunk(); } catch (e) {}
+        try { closeChunk(); } catch {}
       });
 
-      sourceStream.on('error', (err) => {
-        console.error('Source stream error for job', id, err);
-        record.status = 'failed';
+      sourceStream.on("error", (err) => {
+        record.status = "failed";
         record.error = String(err.message || err);
         record.finishedAt = new Date().toISOString();
-        try { parser.destroy(); } catch (e) {}
-        try { closeChunk(); } catch (e) {}
+        try { parser.destroy(); } catch {}
+        try { closeChunk(); } catch {}
       });
 
-      // Pipe stream to parser
       sourceStream.pipe(parser);
-
     } catch (err) {
-      console.error('Failed to start job', id, err);
-      record.status = 'failed';
+      record.status = "failed";
       record.error = String(err.message || err);
       record.finishedAt = new Date().toISOString();
-      try { fs.writeFileSync(path.join(dir, 'error.txt'), String(err.stack || err)); } catch (e) {}
+      try { fs.writeFileSync(path.join(dir, "error.txt"), String(err.stack || err)); } catch {}
     }
   })();
 
-  // Return job id immediately
-  res.status(202).json({ jobId: id, statusUrl: `/jobs/${id}/status`, resultUrl: `/jobs/${id}/result` });
-});
+  return id;
+}
 
-// GET /jobs/:id/status - get job metadata
-app.get('/jobs/:id/status', (req, res) => {
-  const { id } = req.params;
-  const job = jobs.get(id);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  // return metadata without exposing file system paths
-  const safeFiles = job.files.map(f => ({ name: f.name, rows: f.rows }));
-  res.json({ id: job.id, status: job.status, createdAt: job.createdAt, startedAt: job.startedAt, finishedAt: job.finishedAt, totalRows: job.totalRows, files: safeFiles, error: job.error });
-});
+async function exportCsvOnce({ url, mode = "json", limit = null, offset = 0 }) {
+  const MAX_PROTECT = 5000;
+  const response = await axios.get(url, { responseType: "stream" });
+  const sourceStream = response.data;
+  const parser = parse({ columns: true, skip_empty_lines: true });
 
-// GET /jobs/:id/result - list available files or download a specific file
-// Query: ?file=chunk_1.ndjson
-app.get('/jobs/:id/result', (req, res) => {
-  const { id } = req.params;
-  const { file } = req.query;
-  const job = jobs.get(id);
-  if (!job) return res.status(404).json({ error: 'Job not found' });
-  const dir = path.join(JOBS_ROOT, id);
+  if (mode === "ndjson") {
+    let nd = "";
+    let rowIndex = 0;
+    let sent = 0;
 
-  if (file) {
-    // send specific file
-    const safeName = path.basename(file.toString());
-    const filePath = path.join(dir, safeName);
-    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
-    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
-    const stream = fs.createReadStream(filePath);
-    stream.pipe(res);
-    stream.on('error', (err) => {
-      console.error('Error streaming file', err);
-      if (!res.headersSent) res.status(500).json({ error: 'Failed to stream file' });
+    return await new Promise((resolve, reject) => {
+      sourceStream.pipe(parser);
+
+      parser.on("data", (row) => {
+        rowIndex++;
+        if (rowIndex <= offset) return;
+        nd += JSON.stringify(row) + "\n";
+        sent++;
+        if (limit && sent >= limit) {
+          try { sourceStream.destroy(); } catch {}
+          try { parser.destroy(); } catch {}
+          resolve({ ndjson: nd, returned: sent, offset });
+        }
+      });
+
+      parser.on("end", () => resolve({ ndjson: nd, returned: sent, offset }));
+      parser.on("error", reject);
+      sourceStream.on("error", reject);
     });
+  } else {
+    const rows = [];
+    let rowIndex = 0;
+    let sent = 0;
+
+    return await new Promise((resolve, reject) => {
+      sourceStream.pipe(parser);
+
+      parser.on("data", (row) => {
+        rowIndex++;
+        if (rowIndex <= offset) return;
+        rows.push(row);
+        sent++;
+        if (limit && sent >= limit) {
+          try { sourceStream.destroy(); } catch {}
+          try { parser.destroy(); } catch {}
+          resolve({ rows, offset, returned: rows.length, has_more: true });
+        }
+        if (!limit && rows.length > MAX_PROTECT) {
+          try { sourceStream.destroy(); } catch {}
+          try { parser.destroy(); } catch {}
+          resolve({ rows, offset, returned: rows.length, protected: true });
+        }
+      });
+
+      parser.on("end", () => {
+        const has_more = (limit && rowIndex > offset + rows.length) || (!limit && rowIndex > rows.length + offset);
+        resolve({ rows, offset, returned: rows.length, has_more });
+      });
+
+      parser.on("error", reject);
+      sourceStream.on("error", reject);
+    });
+  }
+}
+
+// ---------------------
+// MCP server factory and tool registration
+// ---------------------
+function createMcpServer() {
+  const server = new McpServer(
+    { name: "google-sheet-mcp", version: "0.1.0" },
+    { capabilities: { tools: {} } }
+  );
+
+  const toolRegistry = new Map();
+  const registerTool = (def, handler) => toolRegistry.set(def.name, { def, handler });
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const tools = Array.from(toolRegistry.values()).map((t) => t.def);
+    return { tools };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params ?? {};
+    console.log("[MCP] tools/call", name);
+    const entry = toolRegistry.get(name);
+    if (!entry) return { content: [{ type: "text", text: `Unknown tool: ${name}` }], isError: true };
+    try {
+      const result = await entry.handler(args || {});
+      if (!result || !Array.isArray(result.content)) {
+        return { content: [{ type: "text", text: JSON.stringify(result ?? {}) }], isError: false };
+      }
+      return result;
+    } catch (err) {
+      return { content: [{ type: "text", text: `Tool error: ${String(err.message || err)}` }], isError: true };
+    }
+  });
+
+  // Nudge clients to fetch tools after initialize
+  server.oninitialized = async () => {
+    try {
+      console.log("[MCP] initialized; announcing tool list change");
+      await server.sendToolListChanged();
+    } catch (e) {
+      console.warn("[MCP] sendToolListChanged failed", e);
+    }
+  };
+
+  // Register tools
+  registerTool(
+    {
+      name: "start_gsheets_csv_job",
+      description: "Start an async job that reads a remote CSV (e.g., Google Sheets export) and writes NDJSON chunk files to a local jobs directory.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "HTTP URL to the CSV file" },
+          chunkSize: { type: "number", description: "Rows per NDJSON chunk (default 500)" }
+        },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    async (input) => {
+      try {
+        const jobId = await startCsvJob({ url: input.url, chunkSize: input.chunkSize });
+        const payload = { jobId, message: "Job accepted. Poll with get_job_status or list_job_results." };
+        return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: "text", text: `Failed to start job: ${String(err.message || err)}` }] };
+      }
+    }
+  );
+
+  registerTool(
+    {
+      name: "get_job_status",
+      description: "Get metadata and status for a previously started job.",
+      inputSchema: {
+        type: "object",
+        properties: { jobId: { type: "string" } },
+        required: ["jobId"],
+        additionalProperties: false
+      }
+    },
+    async (input) => {
+      const job = jobs.get(input.jobId);
+      if (!job) return { isError: true, content: [{ type: "text", text: "Job not found" }] };
+      const safeFiles = job.files.map((f) => ({ name: f.name, rows: f.rows }));
+      const payload = {
+        id: job.id,
+        status: job.status,
+        createdAt: job.createdAt,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt,
+        totalRows: job.totalRows,
+        files: safeFiles,
+        error: job.error,
+      };
+      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+    }
+  );
+
+  registerTool(
+    {
+      name: "list_job_results",
+      description: "List NDJSON chunk files for a job.",
+      inputSchema: {
+        type: "object",
+        properties: { jobId: { type: "string" } },
+        required: ["jobId"],
+        additionalProperties: false
+      }
+    },
+    async (input) => {
+      const job = jobs.get(input.jobId);
+      if (!job) return { isError: true, content: [{ type: "text", text: "Job not found" }] };
+      const files = job.files.map((f) => ({ name: f.name, rows: f.rows }));
+      const payload = { id: job.id, status: job.status, totalRows: job.totalRows, files, error: job.error };
+      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+    }
+  );
+
+  registerTool(
+    {
+      name: "get_job_file",
+      description: "Return the contents of a specific NDJSON chunk file for a job.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          jobId: { type: "string" },
+          fileName: { type: "string", description: "e.g., chunk_1.ndjson" },
+          encoding: { type: "string", enum: ["text", "base64"], description: "Return as plain text or base64", default: "text" }
+        },
+        required: ["jobId", "fileName"],
+        additionalProperties: false
+      }
+    },
+    async (input) => {
+      const job = jobs.get(input.jobId);
+      if (!job) return { isError: true, content: [{ type: "text", text: "Job not found" }] };
+      const dir = path.join(JOBS_ROOT, input.jobId);
+      const safeName = path.basename(input.fileName);
+      const filePath = path.join(dir, safeName);
+      if (!fs.existsSync(filePath)) return { isError: true, content: [{ type: "text", text: "File not found" }] };
+
+      if (input.encoding === "base64") {
+        const buf = fs.readFileSync(filePath);
+        return { content: [{ type: "text", text: buf.toString("base64") }] };
+      } else {
+        const data = fs.readFileSync(filePath, "utf8");
+        return { content: [{ type: "text", text: data }] };
+      }
+    }
+  );
+
+  registerTool(
+    {
+      name: "gsheets_export_csv",
+      description: "Fetch a CSV by URL and return either JSON rows (with limit/offset) or NDJSON text.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string" },
+          mode: { type: "string", enum: ["json", "ndjson"], default: "json" },
+          limit: { type: "number", nullable: true },
+          offset: { type: "number", default: 0 }
+        },
+        required: ["url"],
+        additionalProperties: false
+      }
+    },
+    async (input) => {
+      try {
+        const result = await exportCsvOnce({ url: input.url, mode: input.mode || "json", limit: input.limit ?? null, offset: input.offset || 0 });
+        if (input.mode === "ndjson") {
+          return { content: [{ type: "text", text: result.ndjson }] };
+        } else {
+          return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        }
+      } catch (err) {
+        return { isError: true, content: [{ type: "text", text: `Export failed: ${String(err.message || err)}` }] };
+      }
+    }
+  );
+
+  return server;
+}
+
+// ---------------------
+// HTTP Streamable MCP over SSE
+// ---------------------
+class HttpSseTransport {
+  constructor(res) {
+    this.res = res;
+    this.started = false;
+    this.onmessage = undefined;
+    this.onclose = undefined;
+    this.onerror = undefined;
+  }
+  async start() {
+    this.started = true;
+  }
+  async close() {
+    try { this.res.end(); } catch {}
+    this.onclose?.();
+  }
+  async send(message) {
+    try {
+      if (message && message.id !== undefined) {
+        console.log("[MCP->HTTP]", typeof message === "object" ? message.method ?? "response" : "message");
+      }
+      const data = JSON.stringify(message);
+      this.res.write(`data: ${data}\n\n`);
+    } catch (err) {
+      this.onerror?.(err);
+    }
+  }
+  // Called by HTTP route when a client POSTs a message to the server
+  receive(message) {
+    try {
+      if (message && message.method) {
+        console.log("[HTTP->MCP]", message.method);
+      }
+      this.onmessage?.(message);
+    } catch (err) {
+      this.onerror?.(err);
+    }
+  }
+}
+
+// Per-request HTTP transport that returns the response inline (no SSE)
+class HttpDirectTransport {
+  constructor() {
+    this.onmessage = undefined;
+    this.onclose = undefined;
+    this.onerror = undefined;
+    this._response = null;
+    this._done = null;
+    this._donePromise = new Promise((resolve) => (this._done = resolve));
+  }
+  async start() {}
+  async close() { this.onclose?.(); }
+  async send(message) {
+    // Capture the response (request handlers respond via send())
+    this._response = message;
+    this._done?.();
+  }
+  receive(message) {
+    try {
+      this.onmessage?.(message);
+    } catch (err) {
+      this.onerror?.(err);
+    }
+  }
+  async waitResponse(timeoutMs = 10000) {
+    const timer = new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), timeoutMs));
+    await Promise.race([this._donePromise, timer]).catch(() => {});
+    return this._response;
+  }
+}
+
+// Session management
+const sessions = new Map(); // sessionId -> { server, transport, res, keepAlive }
+
+function createSseHeaders(res) {
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+}
+
+function startKeepAlive(res) {
+  return setInterval(() => {
+    try { res.write(": ping\n\n"); } catch {}
+  }, 15000);
+}
+
+// Health endpoint
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// Info endpoint
+app.get(["/"], (_req, res) => {
+  res.type("text").send("GoogleSheet MCP HTTP server is running. Use /mcp or /mcp/sse to connect.");
+});
+
+// SSE endpoint to establish MCP session (primary)
+app.get(["/mcp/sse", "/sse"], async (req, res) => {
+  const sessionId = (req.query.sessionId && String(req.query.sessionId)) || makeId();
+  createSseHeaders(res);
+  res.flushHeaders?.();
+  // Recommend SSE retry
+  res.write(`retry: 15000\n`);
+  res.write(`event: session\n`);
+  res.write(`data: ${JSON.stringify({ sessionId })}\n\n`);
+
+  const transport = new HttpSseTransport(res);
+  const server = createMcpServer();
+  await server.connect(transport);
+
+  const keepAlive = startKeepAlive(res);
+  sessions.set(sessionId, { server, transport, res, keepAlive });
+
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    sessions.delete(sessionId);
+    transport.close().catch(() => {});
+  });
+});
+
+// Back-compat SSE endpoint used by some clients: GET /mcp (always SSE)
+app.get("/mcp", async (req, res) => {
+  const sessionId = (req.query.sessionId && String(req.query.sessionId)) || makeId();
+  createSseHeaders(res);
+  res.flushHeaders?.();
+  res.write(`retry: 15000\n`);
+  res.write(`event: session\n`);
+  res.write(`data: ${JSON.stringify({ sessionId })}\n\n`);
+
+  const transport = new HttpSseTransport(res);
+  const server = createMcpServer();
+  await server.connect(transport);
+
+  const keepAlive = startKeepAlive(res);
+  sessions.set(sessionId, { server, transport, res, keepAlive });
+
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    sessions.delete(sessionId);
+    transport.close().catch(() => {});
+  });
+});
+
+// Endpoint to receive client -> server JSON-RPC messages
+app.post(["/mcp/messages/:sessionId", "/messages/:sessionId"], (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: "Unknown session" });
+  const message = req.body;
+  if (!message) return res.status(400).json({ error: "Missing JSON body" });
+  session.transport.receive(message);
+  res.status(202).json({ ok: true });
+});
+
+// Back-compat message ingress: POST /mcp (uses header/query/body to infer session)
+app.post("/mcp", (req, res) => {
+  // accept a wide range of header names for session id
+  const headers = req.headers || {};
+  const requestedId =
+    headers["x-session-id"] ||
+    headers["x-mcp-session-id"] ||
+    headers["x-mcp-session"] ||
+    headers["mcp-session-id"] ||
+    headers["mcp-session"] ||
+    headers["sessionid"] ||
+    req.query.sessionId ||
+    req.query.session ||
+    req.query.sid ||
+    req.body?.sessionId;
+  // cookie fallback
+  const cookie = headers["cookie"];
+  if (!requestedId && cookie) {
+    const parts = String(cookie).split(/;\s*/);
+    for (const p of parts) {
+      const [k, v] = p.split("=");
+      if (!k || !v) continue;
+      const key = k.trim().toLowerCase();
+      if (key === "sessionid" || key === "mcp-session" || key === "mcp-session-id") {
+        req.headers["x-session-id"] = v; // normalize for logs
+        break;
+      }
+    }
+  }
+  let sessionId = requestedId ? String(requestedId) : undefined;
+  if (!sessionId) {
+    if (sessions.size === 1) {
+      // Use the only active session
+      sessionId = sessions.keys().next().value;
+    }
+  }
+  // If no session, handle as direct HTTP JSON-RPC (single request-response)
+  // This helps clients that POST initialize before opening SSE.
+  // If message has no id (notification), return 204.
+  const message = req.body?.message ?? req.body;
+  if (!message) return res.status(400).json({ error: "Missing JSON body" });
+
+  if (!sessionId) {
+    try {
+      const transport = new HttpDirectTransport();
+      const server = createMcpServer();
+      server.connect(transport).then(() => {
+        transport.receive(message);
+      });
+      transport.waitResponse(10000).then((response) => {
+        if (!response) {
+          // Likely a notification
+          return res.status(204).end();
+        }
+        res.setHeader("Content-Type", "application/json");
+        return res.status(200).send(JSON.stringify(response));
+      }).catch((err) => {
+        console.error("[HTTP] direct handling failed", err);
+        res.status(500).json({ error: "Failed to handle request" });
+      });
+    } catch (e) {
+      console.error("[HTTP] direct transport error", e);
+      return res.status(500).json({ error: "Internal error" });
+    }
     return;
   }
 
-  // otherwise return list of files and job info
-  const safeFiles = job.files.map(f => ({ name: f.name, rows: f.rows, download: `/jobs/${id}/result?file=${encodeURIComponent(f.name)}` }));
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: "Unknown session" });
+  session.transport.receive(message);
+  res.status(202).json({ ok: true });
+});
+
+// Optional: close a session explicitly
+app.post(["/mcp/close/:sessionId", "/close/:sessionId"], async (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: "Unknown session" });
+  clearInterval(session.keepAlive);
+  sessions.delete(sessionId);
+  await session.transport.close();
+  res.json({ closed: true });
+});
+
+// Keep the previous CSV utility endpoints for debugging/direct use
+app.get("/jobs/:id/status", (req, res) => {
+  const { id } = req.params;
+  const job = jobs.get(id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  const safeFiles = job.files.map((f) => ({ name: f.name, rows: f.rows }));
+  res.json({ id: job.id, status: job.status, createdAt: job.createdAt, startedAt: job.startedAt, finishedAt: job.finishedAt, totalRows: job.totalRows, files: safeFiles, error: job.error });
+});
+
+app.get("/jobs/:id/result", (req, res) => {
+  const { id } = req.params;
+  const { file } = req.query;
+  const job = jobs.get(id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  const dir = path.join(JOBS_ROOT, id);
+
+  if (file) {
+    const safeName = path.basename(String(file));
+    const filePath = path.join(dir, safeName);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    fs.createReadStream(filePath).pipe(res);
+    return;
+  }
+
+  const safeFiles = job.files.map((f) => ({ name: f.name, rows: f.rows, download: `/jobs/${id}/result?file=${encodeURIComponent(f.name)}` }));
   res.json({ id: job.id, status: job.status, totalRows: job.totalRows, files: safeFiles, error: job.error });
 });
 
-// Keep the original single-request CSV endpoint for convenience (but it's streaming and protected)
-app.post('/gsheets_export_csv', async (req, res) => {
-  const { url } = req.body;
-  const mode = (req.query.mode || 'json').toLowerCase(); // 'json' or 'ndjson'
-  const limit = req.query.limit ? parseInt(req.query.limit, 10) : null;
-  const offset = req.query.offset ? parseInt(req.query.offset, 10) : 0;
-  const MAX_PROTECT = 5000; // safety cap when no limit provided
-
-  if (!url) {
-    return res.status(400).json({ error: 'Missing url in request body' });
-  }
-
-  try {
-    // Stream the CSV from the remote URL so we don't buffer the whole file in memory
-    const response = await axios.get(url, { responseType: 'stream' });
-    const sourceStream = response.data;
-    const parser = parse({ columns: true, skip_empty_lines: true });
-
-    let rowIndex = 0; // absolute row count
-    let sent = 0;     // rows returned after offset
-    let ended = false;
-
-    function cleanup() {
-      if (ended) return;
-      ended = true;
-      try { sourceStream.destroy(); } catch (e) {}
-      try { parser.destroy(); } catch (e) {}
-      try { res.end(); } catch (e) {}
-    }
-
-    // NDJSON streaming mode: writes one JSON object per line as rows are parsed.
-    if (mode === 'ndjson') {
-      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
-      sourceStream.pipe(parser);
-
-      parser.on('data', (row) => {
-        rowIndex++;
-        if (rowIndex <= offset) return; // skip until offset
-
-        const line = JSON.stringify(row) + '\n';
-        const ok = res.write(line);
-        sent++;
-
-        if (limit && sent >= limit) {
-          cleanup();
-        }
-      });
-
-      parser.on('end', () => { cleanup(); });
-      parser.on('error', (err) => {
-        console.error('CSV parser error:', err);
-        if (!ended) {
-          res.status(500).json({ error: 'CSV parse error' });
-        }
-        cleanup();
-      });
-
-      sourceStream.on('error', (err) => {
-        console.error('Request stream error:', err);
-        if (!ended) {
-          res.status(500).json({ error: 'Failed to fetch CSV stream' });
-        }
-        cleanup();
-      });
-
-    } else {
-      // JSON mode with memory protection and simple pagination (limit/offset)
-      const rows = [];
-      sourceStream.pipe(parser);
-
-      parser.on('data', (row) => {
-        rowIndex++;
-        if (rowIndex <= offset) return; // skip until offset
-
-        rows.push(row);
-        sent++;
-
-        // If user specified a limit, stop when reached
-        if (limit && sent >= limit) {
-          parser.pause();
-          cleanup();
-        }
-
-        // If no limit provided, enforce a server-side cap to avoid OOM / huge responses
-        if (!limit && rows.length > MAX_PROTECT) {
-          console.warn('Server protection: too many rows to return at once');
-          parser.pause();
-          cleanup();
-        }
-      });
-
-      parser.on('end', () => {
-        // has_more indicates if there are more rows after the returned slice
-        const has_more = (limit && rowIndex > offset + rows.length) || (!limit && rowIndex > rows.length + offset);
-        res.json({ rows, offset, returned: rows.length, has_more });
-      });
-
-      parser.on('error', (err) => {
-        console.error('CSV parser error:', err);
-        if (!ended) {
-          res.status(500).json({ error: 'CSV parse error' });
-        }
-        cleanup();
-      });
-
-      sourceStream.on('error', (err) => {
-        console.error('Request stream error:', err);
-        if (!ended) {
-          res.status(500).json({ error: 'Failed to fetch CSV stream' });
-        }
-        cleanup();
-      });
-    }
-
-  } catch (error) {
-    console.error('Error fetching CSV:', error.message);
-    res.status(500).json({ error: 'Failed to fetch or parse CSV' });
-  }
-});
-
-
+// Server start
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, (err) => {
-  if (err) {
-    console.error('Failed to start server:', err);
-    process.exit(1);
-  }
-  console.log(`MCP server running on port ${PORT}`);
+app.listen(PORT, () => {
+  console.log(`HTTP Streamable MCP server listening on port ${PORT}`);
 });

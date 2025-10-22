@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "start": "node index.js",
     "start:http": "node index.js",
     "start:mcp": "node mcp-server.mjs"
   },
@@ -13,5 +14,8 @@
     "csv-parse": "^6.1.0",
     "express": "^5.1.0",
     "google-sheet-mcp": "file:"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
